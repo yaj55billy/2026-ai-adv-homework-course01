@@ -52,7 +52,7 @@ function initializeDatabase() {
       recipient_address TEXT NOT NULL,
       total_amount INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'failed')),
-
+      merchant_trade_no TEXT UNIQUE,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
@@ -71,6 +71,13 @@ function initializeDatabase() {
   // Seed data
   seedAdminUser();
   seedProducts();
+
+  // Migration: add merchant_trade_no if not exists
+  const cols = db.pragma('table_info(orders)');
+  if (!cols.find(c => c.name === 'merchant_trade_no')) {
+    db.exec('ALTER TABLE orders ADD COLUMN merchant_trade_no TEXT');
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_merchant_trade_no ON orders(merchant_trade_no)');
+  }
 }
 
 function seedAdminUser() {
