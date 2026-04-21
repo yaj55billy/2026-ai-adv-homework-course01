@@ -8,7 +8,7 @@
 | 商品瀏覽（列表 / 詳情） | 完成 |
 | 購物車（訪客 + 會員雙模式） | 完成 |
 | 訂單建立與管理 | 完成 |
-| 模擬付款 | 完成 |
+| ECPay AIO 金流串接（信用卡、ATM、網路ATM） | 完成 |
 | 後台商品管理（CRUD） | 完成 |
 | 後台訂單查詢 | 完成 |
 | 前台 EJS 頁面渲染 | 完成 |
@@ -206,11 +206,12 @@
 
 ```
 pending（建立後）
-  ├─ → paid（PATCH /pay，action='success'）
-  └─ → failed（PATCH /pay，action='fail'）
+  ├─ → paid（ECPay 付款成功，RtnCode=1）
+  ├─ → failed（ECPay 付款失敗或取消，RtnCode≠1,2）
+  └─ 保持 pending（ATM 取號成功，RtnCode=2，等待轉帳）
 ```
 
-狀態一旦離開 `pending`，即無法再次更改（`PATCH /pay` 會檢查 `status !== 'pending'` 時回 400）。
+`pending` 與 `failed` 狀態的訂單皆可再次發起付款（允許重試）；`paid` 狀態的訂單無法再次付款（回 400）。
 
 **查詢訂單**：使用者只能看到自己的訂單（WHERE user_id = req.user.userId），防止橫向越權。
 
@@ -224,22 +225,87 @@ pending（建立後）
 | recipientEmail | string | 是 | Email 格式 |
 | recipientAddress | string | 是 | 非空 |
 
-**PATCH /api/orders/:id/pay — Request Body**
-
-| 欄位 | 型別 | 必填 | 允許值 |
-|------|------|------|--------|
-| action | string | 是 | `'success'` 或 `'fail'` |
-
 ### 錯誤碼
 
 | HTTP | error | 情境 |
 |------|-------|------|
-| 400 | `VALIDATION_ERROR` | 收件人資訊缺失或格式錯誤；action 無效 |
+| 400 | `VALIDATION_ERROR` | 收件人資訊缺失或格式錯誤 |
 | 400 | `CART_EMPTY` | 購物車沒有任何商品 |
 | 400 | `STOCK_INSUFFICIENT` | 有商品庫存不足，回傳商品名稱清單 |
-| 400 | `INVALID_STATUS` | 訂單不是 pending 狀態，無法付款 |
 | 401 | `UNAUTHORIZED` | 未攜帶有效 JWT |
 | 404 | `NOT_FOUND` | 訂單 ID 不存在或不屬於該用戶 |
+
+---
+
+## ECPay AIO 金流串接
+
+### 行為描述
+
+使用綠界科技 AIO 全方位金流（測試環境）取代原有的模擬付款按鈕，讓用戶可透過信用卡、ATM 轉帳、網路 ATM 等方式完成真實付款流程。
+
+**發起付款（GET /ecpay/pay/:orderId）**
+
+需要 JWT 認證。伺服器驗證訂單屬於當前用戶且狀態為 `pending` 或 `failed`（允許失敗後重試）後：
+
+1. 以 `Unix timestamp（10碼）+ orderId 前 10 碼英數` 組成唯一的 `MerchantTradeNo`（max 20 chars）
+2. 將 `MerchantTradeNo` 寫入訂單的 `merchant_trade_no` 欄位
+3. 組合 AIO 必填參數（含 `CheckMacValue` SHA256 簽章）並以 JSON 回傳
+
+前端接收 JSON 後動態建立隱藏 input 表單，自動 POST 至綠界付款頁面（`https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5`）。
+
+**付款結果接收（POST /ecpay/return）**
+
+ECPay 完成付款後將瀏覽器 POST 至此路由（`OrderResultURL`）。以 `RtnCode` 判斷結果：
+
+| RtnCode | 意義 | 訂單狀態更新 | 前端跳轉 |
+|---------|------|------------|---------|
+| `1` | 付款成功 | `paid` | `?payment=success` |
+| `2` | ATM 虛擬帳號已開立（等待轉帳） | 不變（維持 `pending`） | `?payment=atm_created` |
+| 其他 | 付款失敗或取消 | `failed` | `?payment=failed` |
+
+> **說明**：ATM 轉帳為非同步付款，用戶取得虛擬帳號後須自行至 ATM 完成轉帳。ECPay 確認轉帳完成後會呼叫 `ReturnURL`（本機開發環境無法接收）。信用卡與網路 ATM 為即時付款，結果可由 `RtnCode` 直接判斷。
+
+**ReturnURL handler（POST /ecpay/notify）**
+
+ECPay 伺服器端通知，直接回傳純字串 `1|OK`（本機環境 ECPay 無法到達，僅為滿足必填參數要求）。
+
+### ECPay 工具函式（src/utils/ecpay.js）
+
+| 函式 | 說明 |
+|------|------|
+| `generateCheckMacValue(params)` | 過濾→排序→URL encode→SHA256→大寫，計算 CheckMacValue |
+| `verifyCheckMacValue(params)` | timing-safe 比較驗證 CheckMacValue |
+| `generateMerchantTradeNo(orderId)` | 產生唯一 MerchantTradeNo（Unix timestamp + orderId 前 10 碼） |
+| `getTaiwanTimeString()` | 回傳 UTC+8 時間字串（`yyyy/MM/dd HH:mm:ss`） |
+| `buildAioParams(order, items, merchantTradeNo)` | 組合 AIO 必填參數，含 `ItemName`（`#` 分隔商品名稱） |
+
+### 環境變數
+
+| 變數 | 說明 |
+|------|------|
+| `ECPAY_MERCHANT_ID` | 商店代號 |
+| `ECPAY_HASH_KEY` | CheckMacValue 用 HashKey |
+| `ECPAY_HASH_IV` | CheckMacValue 用 HashIV |
+| `ECPAY_ENV` | `staging`（測試）或 `production`（正式） |
+| `BASE_URL` | 本機服務 URL（預設 `http://localhost:3001`），用於組合 ReturnURL / OrderResultURL |
+
+### 前端行為（訂單詳情頁）
+
+訂單狀態為 `pending` 或 `failed` 時顯示「前往綠界付款」按鈕。按下後前端呼叫 `GET /ecpay/pay/:orderId`（帶 JWT），取得 AIO 參數後自動提交表單跳轉至綠界付款頁。付款完成後依 `?payment=` 參數顯示對應 banner：
+
+| 參數值 | Banner 訊息 |
+|--------|------------|
+| `success` | 付款成功！感謝您的購買。 |
+| `failed` | 付款失敗，請重試。 |
+| `atm_created` | ATM 虛擬帳號已開立，請在期限內完成轉帳。完成轉帳後訂單狀態將自動更新。 |
+
+### ECPay 路由錯誤碼
+
+| HTTP | 情境 |
+|------|------|
+| 400 | 訂單已付款（`status === 'paid'`），不可再次付款 |
+| 403 | 訂單不屬於當前用戶 |
+| 404 | 訂單 ID 不存在 |
 
 ---
 

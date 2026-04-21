@@ -23,11 +23,14 @@
 │   │   ├── adminMiddleware.js      # 角色驗證，req.user.role !== 'admin' 時回 403
 │   │   ├── sessionMiddleware.js    # 從 X-Session-Id header 提取 session，寫入 req.sessionId
 │   │   └── errorHandler.js        # 全域錯誤處理，捕捉未處理例外回傳 500
+│   ├── utils/
+│   │   └── ecpay.js                # ECPay 工具函式：CheckMacValue 計算、AIO 參數組合
 │   └── routes/
 │       ├── authRoutes.js           # /api/auth — 註冊、登入、個人資料
 │       ├── productRoutes.js        # /api/products — 前台商品列表與詳情（公開）
 │       ├── cartRoutes.js           # /api/cart — 購物車 CRUD（雙模式認證）
-│       ├── orderRoutes.js          # /api/orders — 訂單建立、查詢、付款模擬（需 JWT）
+│       ├── orderRoutes.js          # /api/orders — 訂單建立、查詢（需 JWT）
+│       ├── ecpayRoutes.js          # /ecpay — ECPay AIO 金流：發起付款、付款結果接收
 │       ├── adminProductRoutes.js   # /api/admin/products — 後台商品 CRUD（需 admin）
 │       ├── adminOrderRoutes.js     # /api/admin/orders — 後台訂單查詢（需 admin）
 │       └── pageRoutes.js           # / — EJS 頁面渲染路由
@@ -48,7 +51,7 @@
 │   │       ├── cart.js             # 購物車：數量調整、刪除項目
 │   │       ├── checkout.js         # 結帳：收件資訊表單送出
 │   │       ├── orders.js           # 訂單列表顯示
-│   │       ├── order-detail.js     # 訂單詳情：付款模擬按鈕
+│   │       ├── order-detail.js     # 訂單詳情：ECPay 付款發起、付款結果 banner
 │   │       ├── admin-products.js   # 後台商品管理：CRUD 操作
 │   │       └── admin-orders.js     # 後台訂單管理：列表與狀態篩選
 │   └── stylesheets/
@@ -101,9 +104,10 @@ node server.js
        │    ├─ PRAGMA foreign_keys = ON
        │    ├─ 建立 users / products / cart_items / orders / order_items 表
        │    ├─ seedAdminUser()       # 若 admin email 不存在則插入
-       │    └─ seedProducts()        # 若 products 為空則插入 8 筆花卉商品
+       │    ├─ seedProducts()        # 若 products 為空則插入 8 筆花卉商品
+       │    └─ migration：若 orders 缺少 merchant_trade_no 欄位則 ALTER TABLE 補上
        ├─ 掛載全域 middleware（cors、json、urlencoded、sessionMiddleware）
-       ├─ 掛載 API 路由
+       ├─ 掛載 API 路由（含 ecpayRoutes）
        ├─ 掛載頁面路由（pageRoutes）
        ├─ 掛載 404 handler
        └─ 掛載 errorHandler
@@ -135,7 +139,9 @@ node server.js
 | POST | `/api/orders` | orderRoutes.js | JWT | 從購物車建立訂單 |
 | GET | `/api/orders` | orderRoutes.js | JWT | 我的訂單列表 |
 | GET | `/api/orders/:id` | orderRoutes.js | JWT | 訂單詳情 |
-| PATCH | `/api/orders/:id/pay` | orderRoutes.js | JWT | 模擬付款 |
+| GET | `/ecpay/pay/:orderId` | ecpayRoutes.js | JWT | 發起 ECPay AIO 付款，回傳表單參數 |
+| POST | `/ecpay/return` | ecpayRoutes.js | 無（ECPay 瀏覽器 POST） | 付款結果接收，更新訂單狀態並跳轉 |
+| POST | `/ecpay/notify` | ecpayRoutes.js | 無（ECPay 伺服器 POST） | ReturnURL handler，回傳 `1\|OK` |
 
 ### 後台管理路由（需 JWT + role=admin）
 
@@ -278,6 +284,7 @@ node server.js
 | recipient_address | TEXT | NOT NULL | 收件地址 |
 | total_amount | INTEGER | NOT NULL | 訂單總額（新台幣元） |
 | status | TEXT | NOT NULL, DEFAULT 'pending', CHECK IN ('pending','paid','failed') | 付款狀態 |
+| merchant_trade_no | TEXT | UNIQUE | ECPay 交易編號（發起付款時寫入，重試時覆蓋） |
 | created_at | TEXT | NOT NULL, DEFAULT datetime('now') | 建立時間 |
 
 ### order_items 表
@@ -320,7 +327,16 @@ node server.js
        ├─ UPDATE products SET stock = stock - quantity（逐筆）
        └─ DELETE FROM cart_items WHERE user_id = ?
   ↓
-模擬付款（PATCH /api/orders/:id/pay）
-  ├─ action = 'success' → status 改為 'paid'
-  └─ action = 'fail' → status 改為 'failed'
+ECPay 付款（GET /ecpay/pay/:orderId）
+  ├─ 驗證訂單屬於當前用戶且 status ≠ 'paid'
+  ├─ 產生 MerchantTradeNo，寫入 merchant_trade_no 欄位
+  ├─ 組合 AIO 參數（含 CheckMacValue）
+  └─ 回傳 JSON → 前端自動提交表單至綠界付款頁
+  ↓
+（用戶在綠界完成付款）
+  ↓
+ECPay 付款結果（POST /ecpay/return，瀏覽器跳轉）
+  ├─ RtnCode=1 → status 改為 'paid'
+  ├─ RtnCode=2 → status 不變（ATM 取號成功，等待轉帳）
+  └─ 其他   → status 改為 'failed'（可重新發起付款）
 ```
